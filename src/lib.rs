@@ -180,7 +180,7 @@ fn run_file(path: Option<&str>, engine: Option<&str>, cwd: &Path) -> ExtResponse
     let env = transform_categorical::dim_env(&ast, lang);
     let rules = transform_categorical::collect_rules(&ast, &bound, &env, lang);
     let protected = Arc::new(transform_categorical::dim_arrow_subtrees(&ast, lang));
-    let engine = handl_plugin_engine_transform_rewrite::RewriteEngine::new()
+    let engine = hnl_engine_transform_rewrite::RewriteEngine::new()
         .with_native_registry(transform_categorical::native(
             rules,
             protected,
@@ -658,7 +658,7 @@ fn arrow_display(
                 .and_then(|(src, span)| src.get(span.start..span.end))
                 .map(|s| s.trim().to_string())
                 .or_else(|| {
-                    handl_plugin_engine_fmt::FormatEngine::new()
+                    hnl_engine_fmt::FormatEngine::new()
                         .format(lang, &def, root)
                         .ok()
                         .map(|s| s.trim().to_string())
