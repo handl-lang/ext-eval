@@ -24,7 +24,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use handl_ext::{ExtRequest, ExtResponse, ExtensionManifest};
-use handl_kit_canonical::Kit;
+use handl_kit_prelude::Kit;
+use handl_kit_pkg::KitProjectExt;
 use handl_language::{AstRef, Language};
 use handl_plugin_ext_detect::{Dialect, detect_dialect};
 use serde_json::Value;
@@ -261,7 +262,7 @@ fn eval_expression(expr: Option<&str>, cwd: &Path) -> ExtResponse {
 fn typecheck_wire_prelude() -> &'static std::collections::HashSet<String> {
     static PRELUDE: std::sync::OnceLock<std::collections::HashSet<String>> =
         std::sync::OnceLock::new();
-    PRELUDE.get_or_init(handl_kit_canonical::canonical_wire_names)
+    PRELUDE.get_or_init(handl_kit_prelude::prelude_wire_names)
 }
 
 /// Resolve `path` (possibly relative) against the request's `cwd`.
