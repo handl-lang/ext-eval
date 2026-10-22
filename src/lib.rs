@@ -9,7 +9,7 @@
 //! arms had before the host went dumb.
 //!
 //! Dialect routing matches the old dispatch: canonical-dialect sources are
-//! typechecked through the embedded Handl model (`Kit::typecheck_handl`),
+//! typechecked through the embedded Handl model (`Kit::typecheck_with_prelude`),
 //! then the module's own `~[N]~>` rules optimize the AST (`n_dim_opt`,
 //! [`transform_categorical`]) before eval; contract/arrow dialects skip the
 //! canonical check, same as before.
@@ -149,7 +149,7 @@ fn run_file(path: Option<&str>, engine: Option<&str>, cwd: &Path) -> ExtResponse
     let deps = handl_platform::discover_dependencies(&disk).unwrap_or_default();
     if detect_dialect(&source) == Dialect::Canonical {
         let spliced = spliced_import_names(&source, &bases, &deps);
-        if let Err(e) = kit.typecheck_handl_with_prelude(&source, &spliced) {
+        if let Err(e) = kit.typecheck_with_prelude(&source, &spliced) {
             out.err(format!("run: typecheck failed: {e}"));
             return code(1, out);
         }

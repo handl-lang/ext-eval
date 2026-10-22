@@ -371,6 +371,7 @@ dependencies = [
  "handl-language",
  "handl-lib-type-handl",
  "handl-platform 0.1.0",
+ "handl-plugin-ext-lint",
  "handl-plugin-lib-handl",
  "handl-plugin-lib-stdlib",
  "handl-plugin-module",
@@ -395,10 +396,8 @@ name = "handl-kit-data-prelude"
 version = "0.1.0"
 dependencies = [
  "handl-kit-data",
+ "handl-kit-prelude-lang",
  "handl-language",
- "handl-plugin-ext-diag 0.1.0",
- "handl-runtime",
- "hnl-engine-transform",
  "serde_json",
  "serde_yaml",
 ]
@@ -455,6 +454,7 @@ dependencies = [
  "handl-lib-comb",
  "handl-platform 0.1.0",
  "handl-plugin-ext-diag 0.1.0",
+ "handl-plugin-ext-lint",
  "handl-plugin-lib-char-native",
  "handl-plugin-lib-handl",
  "handl-plugin-lib-stdlib",
@@ -472,6 +472,18 @@ dependencies = [
  "hnl-engine-typecheck-handl",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "handl-kit-prelude-lang"
+version = "0.1.0"
+source = "git+https://github.com/handl-lang/kit-prelude-lang?branch=main#898745330b32c9b9df11eaa2a3922b0f564c67d1"
+dependencies = [
+ "handl-language",
+ "handl-plugin-ext-diag 0.1.0",
+ "hnl-engine-transform",
+ "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]
@@ -881,6 +893,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "handl-plugin-ext-fmt"
+version = "0.1.0"
+source = "git+https://github.com/handl-lang/host?branch=main#e9e98f67bb087baab6592b418d2d2f253a76f9e5"
+dependencies = [
+ "handl-language",
+ "handl-platform 0.1.0",
+ "handl-plugin-ext-diag 0.1.0",
+ "hnl-engine-fmt",
+ "hnl-engine-lex-pattern",
+ "hnl-engine-parse",
+ "hnl-engine-parse-pratt",
+ "serde_json",
+]
+
+[[package]]
+name = "handl-plugin-ext-lint"
+version = "0.1.0"
+source = "git+https://github.com/handl-lang/host?branch=main#e9e98f67bb087baab6592b418d2d2f253a76f9e5"
+dependencies = [
+ "handl-language",
+ "handl-platform 0.1.0",
+ "handl-plugin-ext-diag 0.1.0",
+ "handl-plugin-ext-fmt",
+ "handl-plugin-lib-handl",
+ "hnl-engine-lint",
+ "hnl-engine-typecheck",
+ "serde_json",
+]
+
+[[package]]
 name = "handl-plugin-ffi"
 version = "0.1.0"
 dependencies = [
@@ -924,7 +966,6 @@ dependencies = [
  "hnl-engine-exec-bytecode",
  "hnl-engine-exec-tree-walk",
  "hnl-engine-lex-pattern",
- "hnl-engine-lint",
  "hnl-engine-parse-pratt",
  "hnl-engine-transform",
  "serde_json",
