@@ -40,7 +40,7 @@ mod transform_categorical;
 handl_ext::export!(
     ExtensionManifest::new("eval")
         .version(env!("CARGO_PKG_VERSION"))
-        .command("run", "run [--engine <name>] <file.hnl>")
+        .command("run", "run [--engine <name>] [--name <expr>] <file.hnl>")
         .command("eval", "eval '<expression>'"),
     dispatch
 );
@@ -74,6 +74,7 @@ impl Out {
 
 fn run_command(args: &[String], cwd: &Path) -> ExtResponse {
     let mut engine: Option<String> = None;
+    let mut name: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -86,15 +87,32 @@ fn run_command(args: &[String], cwd: &Path) -> ExtResponse {
                 }
                 engine = Some(args[i].clone());
             }
+            "--name" => {
+                i += 1;
+                if i >= args.len() {
+                    return err("run: --name requires a value\n");
+                }
+                name = Some(args[i].clone());
+            }
             s => positional.push(s.to_string()),
         }
         i += 1;
     }
 
-    run_file(positional.first().map(String::as_str), engine.as_deref(), cwd)
+    run_file(
+        positional.first().map(String::as_str),
+        engine.as_deref(),
+        name.as_deref(),
+        cwd,
+    )
 }
 
-fn run_file(path: Option<&str>, engine: Option<&str>, cwd: &Path) -> ExtResponse {
+fn run_file(
+    path: Option<&str>,
+    engine: Option<&str>,
+    name: Option<&str>,
+    cwd: &Path,
+) -> ExtResponse {
     let mut out = Out::default();
     let path = match path {
         Some(p) => p,
@@ -156,12 +174,7 @@ fn run_file(path: Option<&str>, engine: Option<&str>, cwd: &Path) -> ExtResponse
     }
 
     let source = strip_import_declarations(&source, &bases, &deps);
-    let trimmed = source.trim_start();
-    let wrapped = if trimmed.starts_with("do") {
-        source.to_string()
-    } else {
-        format!("do {{\n{}\n}}", source)
-    };
+    let wrapped = wrap_run_source(&source, name);
 
     // Parse, apply the module's own ~[2]~> rules, then eval the optimized AST.
     let ast = match kit.parse(&wrapped) {
@@ -277,6 +290,72 @@ fn resolve(cwd: &Path, path: &str) -> PathBuf {
 
 fn err(msg: impl Into<String>) -> ExtResponse {
     ExtResponse::error(2, msg.into())
+}
+
+/// Wrap `source` in `do { … }` for `hnl run`. With `--name <expr>` the
+/// block's last statement becomes the named expression instead of the
+/// file's own tail — exports and bindings evaluate first, then `name`
+/// resolves in that scope. A `do`-leading source can't be re-wrapped
+/// (the inner block's scope would swallow its bindings), so `name` is
+/// spliced before the matching close of the leading `do {…}`.
+fn wrap_run_source(source: &str, name: Option<&str>) -> String {
+    let trimmed = source.trim_start();
+    let starts_do = trimmed.starts_with("do");
+    match name {
+        None if starts_do => source.to_string(),
+        None => format!("do {{\n{}\n}}", source),
+        Some(n) => {
+            if starts_do {
+                if let Some(close) = do_block_close(trimmed) {
+                    return format!("{}\n{}\n{}", &trimmed[..close], n, &trimmed[close..]);
+                }
+            }
+            format!("do {{\n{}\n{}\n}}", source, n)
+        }
+    }
+}
+
+/// Position of the `}` that closes the `do {…}` block `src` opens with
+/// (`src` must start with `do`). Braces inside `"`/`'` strings and
+/// `--` line comments don't count. `None` when unmatched.
+fn do_block_close(src: &str) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut i = 2; // skip `do`
+    while i < bytes.len() && bytes[i] != b'{' {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut j = i;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j);
+                }
+            }
+            b'"' | b'\'' => {
+                let quote = bytes[j];
+                j += 1;
+                while j < bytes.len() && bytes[j] != quote {
+                    j += if bytes[j] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'-' if bytes.get(j + 1) == Some(&b'-') => {
+                while j < bytes.len() && bytes[j] != b'\n' {
+                    j += 1;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
 }
 
 fn code(c: i32, out: Out) -> ExtResponse {
@@ -822,6 +901,60 @@ mod tests {
         assert_eq!(res.code, 0, "stdout: {} stderr: {}", res.stdout, res.stderr);
         assert_eq!(res.stdout, "42\n");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_binds_export_decls_for_later_code() {
+        let dir = tmpdir("export");
+        let file = dir.join("main.hnl");
+        std::fs::write(&file, "export x := 41\nexport y := x + 1\ny").unwrap();
+        let res = run_command(&[file.to_string_lossy().into_owned()], &dir);
+        assert_eq!(res.code, 0, "stdout: {} stderr: {}", res.stdout, res.stderr);
+        assert_eq!(res.stdout, "42\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_name_evaluates_the_named_binding() {
+        let dir = tmpdir("name");
+        let file = dir.join("main.hnl");
+        // The block tail (`x + y` = 3) is ignored: `--name y` wins.
+        std::fs::write(&file, "export x := 1\nexport y := x + 41\nx + y").unwrap();
+        let res = run_command(
+            &["--name".into(), "y".into(), file.to_string_lossy().into_owned()],
+            &dir,
+        );
+        assert_eq!(res.code, 0, "stdout: {} stderr: {}", res.stdout, res.stderr);
+        assert_eq!(res.stdout, "42\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_name_splices_into_a_do_leading_file() {
+        let dir = tmpdir("name-do");
+        let file = dir.join("main.hnl");
+        // (an `export` inside `do {…}` is a separate checker gap —
+        // unbound wire — so the splice is exercised with a plain
+        // binding here; top-level exports are covered above.)
+        std::fs::write(&file, "do {\n  x := 41\n  x + 1\n}").unwrap();
+        let res = run_command(
+            &["--name".into(), "x".into(), file.to_string_lossy().into_owned()],
+            &dir,
+        );
+        assert_eq!(res.code, 0, "stdout: {} stderr: {}", res.stdout, res.stderr);
+        assert_eq!(res.stdout, "41\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn wrap_run_source_variants() {
+        assert_eq!(wrap_run_source("1 + 2", None), "do {\n1 + 2\n}");
+        assert_eq!(wrap_run_source("do { 1 }", None), "do { 1 }");
+        assert_eq!(wrap_run_source("1 + 2", Some("x")), "do {\n1 + 2\nx\n}");
+        assert_eq!(
+            wrap_run_source("do { a := \"}\" -- c\n a }", Some("f")),
+            "do { a := \"}\" -- c\n a \nf\n}"
+        );
     }
 
     /// The `export!`-generated manifest symbol, called directly.
