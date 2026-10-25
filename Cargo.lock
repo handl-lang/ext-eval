@@ -1268,6 +1268,7 @@ dependencies = [
  "handl-value",
  "serde",
  "serde_json",
+ "stacker",
 ]
 
 [[package]]
@@ -1279,6 +1280,7 @@ dependencies = [
  "handl-value",
  "rustc-hash",
  "serde_json",
+ "stacker",
 ]
 
 [[package]]
@@ -1296,6 +1298,7 @@ dependencies = [
  "hnl-engine-transform-rewrite",
  "rustc-hash",
  "serde_json",
+ "stacker",
 ]
 
 [[package]]
@@ -1316,6 +1319,7 @@ dependencies = [
  "hnl-engine-exec-tree-walk",
  "rustc-hash",
  "serde_json",
+ "stacker",
 ]
 
 [[package]]
@@ -1329,6 +1333,7 @@ dependencies = [
  "hnl-engine-exec",
  "rustc-hash",
  "serde_json",
+ "stacker",
 ]
 
 [[package]]
@@ -2432,10 +2437,6 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[patch.unused]]
-name = "handl-lib-dedent"
-version = "0.1.0"
 
 [[patch.unused]]
 name = "sepia-acp"
