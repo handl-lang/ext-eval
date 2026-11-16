@@ -209,8 +209,9 @@ fn run_file(
     };
 
     match kit.runtime().eval(&out_pass.ast) {
-        Ok(value) => {
-            out.stdout.push_str(&print_value(&value, lang, Some(wrapped.as_str())));
+        Ok(mut value) => {
+            out.stdout
+                .push_str(&print_value(&mut value, lang, Some(wrapped.as_str())));
             code(0, out)
         }
         Err(e) => {
@@ -255,8 +256,9 @@ fn eval_expression(expr: Option<&str>, cwd: &Path) -> ExtResponse {
     let wrapped = format!("do {{ {} }}", expr);
     let lang = kit.runtime().lang();
     match kit.eval(&wrapped) {
-        Ok(value) => {
-            out.stdout.push_str(&print_value(&value, lang, Some(wrapped.as_str())));
+        Ok(mut value) => {
+            out.stdout
+                .push_str(&print_value(&mut value, lang, Some(wrapped.as_str())));
             code(0, out)
         }
         Err(e) => {
@@ -592,7 +594,13 @@ fn first_quoted_spec(s: &str) -> Option<&str> {
     let end = rest.as_bytes().iter().position(|&b| b == quote)?;
     Some(&rest[..end])
 }
-fn print_value(value: &Value, lang: &Language, source: Option<&str>) -> String {
+fn print_value(value: &mut Value, lang: &Language, source: Option<&str>) -> String {
+    // ADR-0179: tensors with `numel >= TENSOR_BIN_THRESHOLD` cross the
+    // engine boundary as `{"__tensor__": {…, "data": {"__tensor_bin__":
+    // "<base64 LE>"}}}` — expand them back to the array `data` spelling
+    // before printing, the same egress step `hnl-run` performs, so
+    // `hnl run`/`hnl eval` stdout consumers always see `data` as a list.
+    handl_value::materialize_tensor_bin(value);
     if let Some(s) = value.as_str() {
         format!("{s}\n")
     } else if let Some(s) = arrow_display(value, lang, source, None, 0) {
@@ -955,6 +963,35 @@ mod tests {
             wrap_run_source("do { a := \"}\" -- c\n a }", Some("f")),
             "do { a := \"}\" -- c\n a \nf\n}"
         );
+    }
+
+    /// ADR-0179 egress: a tensor at/above `TENSOR_BIN_THRESHOLD` reaches
+    /// `hnl run`/`eval` as a `{"__tensor_bin__": "<base64 LE>"}` record;
+    /// `print_value` must expand it to the array `data` spelling before
+    /// serializing (the same step `hnl-run` performs).
+    #[test]
+    fn print_value_materializes_tensor_bin() {
+        let shape = [64usize, 64];
+        let payload: Vec<u8> = (0..4096u64)
+            .flat_map(|x| (x as f64).to_le_bytes())
+            .collect();
+        let mut v = handl_value::tensor_bin_record(&shape, "f64", &payload).unwrap();
+        assert!(
+            serde_json::to_string(&v)
+                .unwrap()
+                .contains("__tensor_bin__")
+        );
+
+        let out = print_value(&mut v, &Language::new(), None);
+        assert!(!out.contains("__tensor_bin__"), "stdout: {out}");
+        let parsed: Value = serde_json::from_str(out.trim()).unwrap();
+        let tensor = &parsed["__tensor__"];
+        assert_eq!(tensor["dtype"], "f64");
+        assert_eq!(tensor["shape"], serde_json::json!([64, 64]));
+        let data = tensor["data"].as_array().unwrap();
+        assert_eq!(data.len(), 4096);
+        assert_eq!(data[0], serde_json::json!(0.0));
+        assert_eq!(data[4095], serde_json::json!(4095.0));
     }
 
     /// The `export!`-generated manifest symbol, called directly.

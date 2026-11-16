@@ -26,6 +26,7 @@ hnl-engine-parse-pratt = { git = "https://github.com/handl-lang/engine-parse-pra
 hnl-engine-transform = { git = "https://github.com/handl-lang/engine-transform", branch = "main" }
 hnl-engine-transform-rewrite = { git = "https://github.com/handl-lang/engine-transform-rewrite", branch = "main" }
 handl-runtime = { git = "https://github.com/handl-lang/host", branch = "main" }
+handl-value = { git = "https://github.com/handl-lang/kernel", branch = "main" }
 serde_json = "1"
 
 # ADR-0128 §Resolution: local development resolves sibling-repo deps from

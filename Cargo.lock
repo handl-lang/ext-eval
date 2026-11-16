@@ -490,6 +490,7 @@ dependencies = [
  "hnl-engine-parse-pratt",
  "hnl-engine-typecheck",
  "hnl-engine-typecheck-nbe",
+ "libc",
  "serde",
  "serde_json",
 ]
@@ -1324,6 +1325,7 @@ dependencies = [
  "handl-plugin-ext-detect",
  "handl-plugin-ext-diag",
  "handl-runtime",
+ "handl-value",
  "hnl-engine-fmt",
  "hnl-engine-lex-pattern",
  "hnl-engine-parse",
