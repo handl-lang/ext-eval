@@ -40,8 +40,11 @@ mod transform_categorical;
 handl_ext::export!(
     ExtensionManifest::new("eval")
         .version(env!("CARGO_PKG_VERSION"))
-        .command("run", "run [--engine <name>] [--name <expr>] <file.hnl>")
-        .command("eval", "eval '<expression>'"),
+        .command(
+            "run",
+            "run [--engine <name>] [--name <expr>] [--kit <dir>] <file.hnl>",
+        )
+        .command("eval", "eval [--kit <dir>] '<expression>'"),
     dispatch
 );
 
@@ -75,6 +78,7 @@ impl Out {
 fn run_command(args: &[String], cwd: &Path) -> ExtResponse {
     let mut engine: Option<String> = None;
     let mut name: Option<String> = None;
+    let mut kit: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -94,6 +98,16 @@ fn run_command(args: &[String], cwd: &Path) -> ExtResponse {
                 }
                 name = Some(args[i].clone());
             }
+            "--kit" => {
+                i += 1;
+                if i >= args.len() {
+                    return err("run: --kit requires a value\n");
+                }
+                kit = Some(args[i].clone());
+            }
+            s if s.starts_with("--kit=") => {
+                kit = Some(s["--kit=".len()..].to_string());
+            }
             s => positional.push(s.to_string()),
         }
         i += 1;
@@ -103,6 +117,7 @@ fn run_command(args: &[String], cwd: &Path) -> ExtResponse {
         positional.first().map(String::as_str),
         engine.as_deref(),
         name.as_deref(),
+        kit.as_deref(),
         cwd,
     )
 }
@@ -111,6 +126,7 @@ fn run_file(
     path: Option<&str>,
     engine: Option<&str>,
     name: Option<&str>,
+    kit: Option<&str>,
     cwd: &Path,
 ) -> ExtResponse {
     let mut out = Out::default();
@@ -131,24 +147,36 @@ fn run_file(
         }
     };
 
+    // `--kit <dir-or-name>`: resolve to a kit directory before building
+    // the kit so its `libs` deps merge into the project deps below.
+    let kit_dir = match kit {
+        Some(v) => match resolve_kit_dir(cwd, v, "run") {
+            Ok(d) => Some(d),
+            Err(msg) => {
+                out.err(msg);
+                return code(2, out);
+            }
+        },
+        None => None,
+    };
+
     // Project-aware kit: discover `.handl.toml` by walking up from the
     // source file's directory; its `[dependencies]` table feeds the module
     // loader and its directory becomes the module root for `import "path"`.
-    let kit = match engine {
-        Some(name) => match Kit::discover_with_eval(&disk, name) {
-            Ok(k) => k,
-            Err(e) => {
-                out.err(format!("run: {e}"));
-                return code(1, out);
-            }
-        },
-        None => match Kit::discover(&disk) {
-            Ok(k) => k,
-            Err(e) => {
-                out.err(format!("run: {e}"));
-                return code(1, out);
-            }
-        },
+    // A `--kit` directory adds its `kit.hnl` `libs` (+ transitive `pkg.hnl`
+    // deps) as fill-missing entries on top.
+    let kit = match (engine, kit_dir.as_deref()) {
+        (Some(name), Some(kd)) => Kit::discover_with_kit_and_eval(&disk, name, kd),
+        (Some(name), None) => Kit::discover_with_eval(&disk, name),
+        (None, Some(kd)) => Kit::discover_with_kit(&disk, kd),
+        (None, None) => Kit::discover(&disk),
+    };
+    let kit = match kit {
+        Ok(k) => k,
+        Err(e) => {
+            out.err(format!("run: {e}"));
+            return code(1, out);
+        }
     };
 
     // Resolution bases for `from "<spec>"` declaration lines, mirroring
@@ -226,22 +254,60 @@ fn run_file(
 // ---------------------------------------------------------------------------
 
 fn eval_command(args: &[String], cwd: &Path) -> ExtResponse {
-    eval_expression(args.first().map(String::as_str), cwd)
+    // `eval [--kit <dir>] '<expression>'` — only `--kit`/`--kit=` are
+    // intercepted; every other token (including a leading `--`) stays part
+    // of the expression, preserving the old first-arg-is-the-expr shape.
+    let mut kit: Option<String> = None;
+    let mut positional: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--kit" => {
+                i += 1;
+                if i >= args.len() {
+                    return err("eval: --kit requires a value\n");
+                }
+                kit = Some(args[i].clone());
+            }
+            s if s.starts_with("--kit=") => {
+                kit = Some(s["--kit=".len()..].to_string());
+            }
+            s => positional.push(s),
+        }
+        i += 1;
+    }
+    eval_expression(positional.first().copied(), kit.as_deref(), cwd)
 }
 
-fn eval_expression(expr: Option<&str>, cwd: &Path) -> ExtResponse {
+fn eval_expression(expr: Option<&str>, kit: Option<&str>, cwd: &Path) -> ExtResponse {
     let mut out = Out::default();
     let expr = match expr {
         Some(e) => e,
         None => {
-            out.err("usage: hnl eval <expression>");
+            out.err("usage: hnl eval [--kit <dir>] <expression>");
             return code(2, out);
         }
     };
 
+    let kit_dir = match kit {
+        Some(v) => match resolve_kit_dir(cwd, v, "eval") {
+            Ok(d) => Some(d),
+            Err(msg) => {
+                out.err(msg);
+                return code(2, out);
+            }
+        },
+        None => None,
+    };
+
     // Project-aware kit: discover `.handl.toml` from the CWD upward so
-    // `import "dep/..."` resolves against `[dependencies]`.
-    let kit = match Kit::discover(cwd) {
+    // `import "dep/..."` resolves against `[dependencies]`; `--kit` merges
+    // a `kit.hnl` kit's `libs` (+ transitive `pkg.hnl` deps) on top.
+    let kit = match kit_dir {
+        Some(kd) => Kit::discover_with_kit(cwd, &kd),
+        None => Kit::discover(cwd),
+    };
+    let kit = match kit {
         Ok(k) => k,
         Err(e) => {
             out.err(format!("eval: {e}"));
@@ -288,6 +354,37 @@ fn resolve(cwd: &Path, path: &str) -> PathBuf {
     } else {
         cwd.join(p)
     }
+}
+
+/// Resolve a `--kit` value to a kit directory: the value itself (a path to
+/// the kit repo root or its `kit.hnl`, relative to `cwd`), then — for a
+/// bare name with no path separator — the workspace conventions
+/// `cwd/kit-<name>` and `cwd/../kit-<name>` (kits are `kit-<name>` sibling
+/// checkouts, e.g. `--kit web-server` → `kit-web-server`).
+///
+/// `cmd` prefixes the error (`run:`/`eval:`). Returns `Err` when no
+/// candidate contains a `kit.hnl`.
+fn resolve_kit_dir(cwd: &Path, value: &str, cmd: &str) -> Result<PathBuf, String> {
+    let is_kit = |dir: &Path| dir.join("kit.hnl").is_file();
+    let direct = resolve(cwd, value);
+    if is_kit(&direct) || (direct.is_file() && direct.file_name().is_some_and(|n| n == "kit.hnl")) {
+        return Ok(direct);
+    }
+    if !value.contains('/') && !value.contains('\\') {
+        let mut bases = vec![cwd.to_path_buf()];
+        if let Some(parent) = cwd.parent() {
+            bases.push(parent.to_path_buf());
+        }
+        for base in bases {
+            let candidate = base.join(format!("kit-{value}"));
+            if is_kit(&candidate) {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(format!(
+        "{cmd}: --kit {value}: no kit.hnl found (expected a kit directory or a sibling kit-<name> checkout)"
+    ))
 }
 
 fn err(msg: impl Into<String>) -> ExtResponse {
@@ -879,7 +976,7 @@ mod tests {
     fn eval_without_an_expression_is_usage_error() {
         let res = eval_command(&[], Path::new("."));
         assert_eq!(res.code, 2);
-        assert!(res.stderr.contains("usage: hnl eval <expression>"));
+        assert!(res.stderr.contains("usage: hnl eval"));
     }
 
     #[test]
@@ -951,6 +1048,97 @@ mod tests {
         );
         assert_eq!(res.code, 0, "stdout: {} stderr: {}", res.stdout, res.stderr);
         assert_eq!(res.stdout, "41\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_kit_requires_a_value() {
+        let res = run_command(&["--kit".into()], Path::new("."));
+        assert_eq!(res.code, 2);
+        assert!(res.stderr.contains("run: --kit requires a value"));
+    }
+
+    #[test]
+    fn eval_kit_requires_a_value() {
+        let res = eval_command(&["--kit".into()], Path::new("."));
+        assert_eq!(res.code, 2);
+        assert!(res.stderr.contains("eval: --kit requires a value"));
+    }
+
+    #[test]
+    fn run_missing_kit_dir_is_usage_error() {
+        let dir = tmpdir("kit-missing");
+        let file = dir.join("main.hnl");
+        std::fs::write(&file, "1").unwrap();
+        let res = run_command(
+            &[
+                "--kit".into(),
+                "no-such-kit".into(),
+                file.to_string_lossy().into_owned(),
+            ],
+            &dir,
+        );
+        assert_eq!(res.code, 2);
+        assert!(res.stderr.contains("no kit.hnl"), "stderr: {}", res.stderr);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn eval_missing_kit_dir_is_usage_error() {
+        let dir = tmpdir("eval-kit-missing");
+        let res = eval_command(
+            &["--kit".into(), "no-such-kit".into(), "1 + 2".into()],
+            &dir,
+        );
+        assert_eq!(res.code, 2);
+        assert!(res.stderr.contains("no kit.hnl"), "stderr: {}", res.stderr);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `resolve_kit_dir`: a path to the kit dir (or its `kit.hnl`) wins;
+    /// a bare name probes `cwd/kit-<name>` then `cwd/../kit-<name>`.
+    #[test]
+    fn resolve_kit_dir_path_and_name_forms() {
+        let dir = tmpdir("kit-name");
+        let kit = dir.join("kit-demo");
+        std::fs::create_dir_all(&kit).unwrap();
+        std::fs::write(kit.join("kit.hnl"), "{ libs: [] }\n").unwrap();
+        let proj = dir.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        // Path form (relative to cwd) and the kit.hnl file itself.
+        assert_eq!(
+            resolve_kit_dir(&dir, "kit-demo", "run").unwrap(),
+            kit
+        );
+        assert_eq!(
+            resolve_kit_dir(&dir, "kit-demo/kit.hnl", "run").unwrap(),
+            kit.join("kit.hnl")
+        );
+        // Bare name: sibling probe from cwd and from a child dir.
+        assert_eq!(resolve_kit_dir(&dir, "demo", "run").unwrap(), kit);
+        assert_eq!(resolve_kit_dir(&proj, "demo", "run").unwrap(), kit);
+        // Names containing a separator skip the sibling probe.
+        assert!(resolve_kit_dir(&dir, "sub/dir", "run").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn eval_with_kit_flag_evaluates() {
+        let dir = tmpdir("eval-kit");
+        let kit = dir.join("kit-x");
+        std::fs::create_dir_all(&kit).unwrap();
+        std::fs::write(kit.join("kit.hnl"), "{ libs: [] }\n").unwrap();
+        let res = eval_command(
+            &[
+                "--kit".into(),
+                kit.to_string_lossy().into_owned(),
+                "1 + 2".into(),
+            ],
+            &dir,
+        );
+        assert_eq!(res.code, 0, "stdout: {} stderr: {}", res.stdout, res.stderr);
+        assert_eq!(res.stdout, "3\n");
         std::fs::remove_dir_all(&dir).ok();
     }
 
