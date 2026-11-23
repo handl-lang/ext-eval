@@ -24,6 +24,7 @@ handl-language = { git = "https://github.com/handl-lang/kernel", branch = "main"
 handl-kit-prelude = { git = "https://github.com/handl-lang/host", branch = "main" }
 handl-kit-pkg = { git = "https://github.com/handl-lang/kit-pkg", branch = "main" }
 handl-platform = { git = "https://github.com/handl-lang/host", branch = "main" }
+handl-run = { git = "https://github.com/handl-lang/host", branch = "main" }
 handl-plugin-ext-detect = { git = "https://github.com/handl-lang/host", branch = "main" }
 hnl-engine-fmt = { git = "https://github.com/handl-lang/engine-fmt", branch = "main" }
 handl-plugin-ext-diag = { git = "https://github.com/handl-lang/host", branch = "main" }
@@ -55,6 +56,7 @@ handl-kit-lang = { path = "../host/crates/handl-kit-lang" }
 handl-kit-eqsat = { path = "../host/crates/handl-kit-eqsat" }
 handl-kit-mlopt = { path = "../host/crates/kit-mlopt" }
 hnl-ext-mlopt = { path = "../host/crates/hnl-ext-mlopt" }
+handl-run = { path = "../host/crates/run" }
 
 [patch."https://github.com/handl-lang/engine-test"]
 handl-kit-test = { path = "../engine-test/crates/kit-test" }

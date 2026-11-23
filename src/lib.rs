@@ -42,7 +42,7 @@ handl_ext::export!(
         .version(env!("CARGO_PKG_VERSION"))
         .command(
             "run",
-            "run [--engine <name>] [--name <expr>] [--kit <dir>] <file.hnl>",
+            "run [--engine <name>] [--name <expr>] [--kit <dir>] <file.hnl> | run [--plan] [--cache|--no-cache] [--json] <script> [args…]",
         )
         .command("eval", "eval [--kit <dir>] '<expression>'"),
     dispatch
@@ -75,51 +75,335 @@ impl Out {
     }
 }
 
+/// `hnl run` — shape-dispatched (P-003):
+///
+/// - first positional resolving to an existing path (or carrying a
+///   `.hnl` suffix) → file execution, unchanged;
+/// - a bare name → `pkg.hnl` `scripts:` resolution via `handl-run`
+///   (walk-up from cwd), with runner flags `--plan`/`--cache`/
+///   `--no-cache`/`--json` recognized **only before the name** —
+///   everything after it is verbatim script argv (`--` is an optional
+///   npm-style separator);
+/// - no name → list the discovered package's scripts (`npm run`), or
+///   the usage error when no `pkg.hnl`/`scripts` exist.
 fn run_command(args: &[String], cwd: &Path) -> ExtResponse {
     let mut engine: Option<String> = None;
     let mut name: Option<String> = None;
     let mut kit: Option<String> = None;
+    let mut plan = false;
+    let mut cache_flag = false;
+    let mut cache_disabled = false;
+    let mut json = false;
     let mut positional: Vec<String> = Vec::new();
+    // Runner/file-exec flags are recognized only before the first
+    // positional (the file or script name); `--` ends flag parsing.
+    // Everything after the name is verbatim script argv.
+    let mut flags_done = false;
 
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--engine" => {
-                i += 1;
-                if i >= args.len() {
-                    return err("run: --engine requires a value\n");
+        let t = args[i].as_str();
+        if flags_done {
+            positional.push(t.to_string());
+        } else {
+            match t {
+                "--" => flags_done = true,
+                "--plan" => plan = true,
+                "--cache" => cache_flag = true,
+                "--no-cache" => {
+                    cache_flag = true;
+                    cache_disabled = true;
                 }
-                engine = Some(args[i].clone());
-            }
-            "--name" => {
-                i += 1;
-                if i >= args.len() {
-                    return err("run: --name requires a value\n");
+                "--json" => json = true,
+                "--engine" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return err("run: --engine requires a value\n");
+                    }
+                    engine = Some(args[i].clone());
                 }
-                name = Some(args[i].clone());
-            }
-            "--kit" => {
-                i += 1;
-                if i >= args.len() {
-                    return err("run: --kit requires a value\n");
+                "--name" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return err("run: --name requires a value\n");
+                    }
+                    name = Some(args[i].clone());
                 }
-                kit = Some(args[i].clone());
+                "--kit" => {
+                    i += 1;
+                    if i >= args.len() {
+                        return err("run: --kit requires a value\n");
+                    }
+                    kit = Some(args[i].clone());
+                }
+                s if s.starts_with("--engine=") => {
+                    engine = Some(s["--engine=".len()..].to_string());
+                }
+                s if s.starts_with("--name=") => {
+                    name = Some(s["--name=".len()..].to_string());
+                }
+                s if s.starts_with("--kit=") => {
+                    kit = Some(s["--kit=".len()..].to_string());
+                }
+                // An unrecognized `--flag`/`-x` before the name is a
+                // usage error — script args belong after the name.
+                s if s.starts_with('-') && s.len() > 1 => {
+                    return err(format!(
+                        "run: unknown flag `{s}` before the script/file name (script args go after the name)\n"
+                    ));
+                }
+                _ => {
+                    flags_done = true;
+                    positional.push(t.to_string());
+                }
             }
-            s if s.starts_with("--kit=") => {
-                kit = Some(s["--kit=".len()..].to_string());
-            }
-            s => positional.push(s.to_string()),
         }
         i += 1;
     }
 
-    run_file(
-        positional.first().map(String::as_str),
-        engine.as_deref(),
-        name.as_deref(),
-        kit.as_deref(),
+    let runner_flag_used = plan || json || cache_flag;
+    let file_flags_used = engine.is_some() || name.is_some() || kit.is_some();
+
+    let Some(first) = positional.first() else {
+        // `hnl run` with no name: list the nearest pkg.hnl's scripts;
+        // file-exec flags or no package at all keep today's usage error.
+        if file_flags_used {
+            return run_file(
+                None,
+                engine.as_deref(),
+                name.as_deref(),
+                kit.as_deref(),
+                cwd,
+            );
+        }
+        return match handl_run::PkgScripts::discover(cwd) {
+            Some(pkg) if !pkg.scripts.is_empty() => {
+                let mut out = Out::default();
+                for line in handl_run::list_scripts(&pkg) {
+                    out.stdout.push_str(&line);
+                    out.stdout.push('\n');
+                }
+                code(0, out)
+            }
+            _ => {
+                let mut out = Out::default();
+                out.err("usage: hnl run <file.handl>");
+                code(2, out)
+            }
+        };
+    };
+
+    // Name-vs-file precedence: an existing filesystem path always wins
+    // (a `.hnl` suffix counts even when missing — the read error names
+    // it); anything else is a script name.
+    let disk = resolve(cwd, first);
+    if first.ends_with(".hnl") || disk.is_file() {
+        if runner_flag_used {
+            return err(
+                "run: --plan/--cache/--no-cache/--json apply to pkg.hnl script names, not file execution\n",
+            );
+        }
+        return run_file(
+            Some(first),
+            engine.as_deref(),
+            name.as_deref(),
+            kit.as_deref(),
+            cwd,
+        );
+    }
+
+    run_script(
+        first,
+        &positional[1..],
+        RunInvocation {
+            plan,
+            json,
+            cache_disabled,
+        },
+        engine.is_some() || name.is_some() || kit.is_some(),
         cwd,
     )
+}
+
+/// The runner flags that survived header parsing for a script run.
+struct RunInvocation {
+    plan: bool,
+    json: bool,
+    cache_disabled: bool,
+}
+
+/// `hnl run <script> [args…]` — delegate to `handl-run`'s `Runner`.
+/// Everything after the name is verbatim argv; a single leading `--`
+/// is the optional npm-style separator and is stripped.
+fn run_script(
+    script: &str,
+    args: &[String],
+    inv: RunInvocation,
+    file_flags_used: bool,
+    cwd: &Path,
+) -> ExtResponse {
+    if file_flags_used {
+        return err(
+            "run: --engine/--name/--kit do not apply to script names (they are file-execution flags)\n",
+        );
+    }
+    // Script-resolution failures are runtime errors (exit 1), not usage
+    // errors — npm exits 1 for a missing script too.
+    let fail = |msg: String| ExtResponse::error(1, msg);
+    let mut script_args = args;
+    if script_args.first().is_some_and(|a| a == "--") {
+        script_args = &script_args[1..];
+    }
+
+    let pkg = match handl_run::PkgScripts::discover(cwd) {
+        Some(p) => p,
+        None => {
+            return fail(format!(
+                "run: no pkg.hnl found walking up from {} — cannot resolve script `{script}`\n",
+                cwd.display()
+            ));
+        }
+    };
+
+    let options = handl_run::RunOptions {
+        cache: if inv.cache_disabled {
+            handl_run::CacheMode::Disabled
+        } else {
+            handl_run::CacheMode::Enabled
+        },
+        toolchain: run_toolchain(),
+        depth: None,
+        // Streams return through ExtResponse — keep the process streams
+        // clean so `--json` output stays machine-readable.
+        echo: false,
+    };
+    let runner = handl_run::Runner::with_options(options);
+
+    if inv.plan {
+        return match runner.plan(&pkg, script, script_args) {
+            Ok(report) => plan_response(&report, inv.json),
+            Err(e) => fail(format!("run: {e}\n")),
+        };
+    }
+    match runner.run(&pkg, script, script_args) {
+        Ok(report) => run_report_response(&report, inv.json),
+        Err(e) => fail(format!("run: {e}\n")),
+    }
+}
+
+/// The cache-key toolchain: `hnl` host version via the environment
+/// ([`handl_run::Toolchain::detect`]) and this extension's own
+/// `CARGO_PKG_VERSION` — the code that actually runs `.hnl` files.
+fn run_toolchain() -> handl_run::Toolchain {
+    let mut t = handl_run::Toolchain::detect();
+    t.ext_eval = env!("CARGO_PKG_VERSION").to_string();
+    t
+}
+
+/// Render a [`handl_run::RunReport`]: child streams to their own
+/// channels, cache messages to stderr, exit code propagated. `--json`
+/// emits the whole report as one JSON value on stdout instead.
+fn run_report_response(report: &handl_run::RunReport, json: bool) -> ExtResponse {
+    if json {
+        let tasks: Vec<Value> = report
+            .tasks
+            .iter()
+            .map(|t| {
+                let (status, code) = match &t.status {
+                    handl_run::TaskStatus::Ran { code } => ("ran", Some(*code)),
+                    handl_run::TaskStatus::CacheHit { code } => ("cache_hit", Some(*code)),
+                    handl_run::TaskStatus::Skipped => ("skipped", None),
+                };
+                serde_json::json!({
+                    "name": t.name,
+                    "status": status,
+                    "code": code,
+                    "miss_reason": t.miss_reason,
+                })
+            })
+            .collect();
+        let value = serde_json::json!({
+            "script": report.script,
+            "order": report.order,
+            "tasks": tasks,
+            "exit_code": report.exit_code,
+            "messages": report.messages,
+            "stdout": String::from_utf8_lossy(&report.stdout),
+            "stderr": String::from_utf8_lossy(&report.stderr),
+        });
+        return ExtResponse {
+            code: report.exit_code,
+            stdout: format!(
+                "{}\n",
+                serde_json::to_string_pretty(&value).unwrap_or_default()
+            ),
+            stderr: String::new(),
+        };
+    }
+    let mut out = Out::default();
+    for m in &report.messages {
+        out.err(m);
+    }
+    out.stderr
+        .push_str(&String::from_utf8_lossy(&report.stderr));
+    out.stdout
+        .push_str(&String::from_utf8_lossy(&report.stdout));
+    ExtResponse {
+        code: report.exit_code,
+        stdout: out.stdout,
+        stderr: out.stderr,
+    }
+}
+
+/// `--plan` output: per-task cache verdicts without executing —
+/// text lines, or the [`handl_run::PlanReport`] as JSON under `--json`.
+fn plan_response(report: &handl_run::PlanReport, json: bool) -> ExtResponse {
+    if json {
+        let tasks: Vec<Value> = report
+            .tasks
+            .iter()
+            .map(|t| {
+                let (verdict, reason) = match &t.verdict {
+                    handl_run::PlanVerdict::Hit => ("hit", Value::Null),
+                    handl_run::PlanVerdict::Miss(r) => ("miss", Value::from(r.clone())),
+                    handl_run::PlanVerdict::Uncached => ("uncached", Value::Null),
+                };
+                serde_json::json!({
+                    "name": t.name,
+                    "verdict": verdict,
+                    "reason": reason,
+                })
+            })
+            .collect();
+        let value = serde_json::json!({
+            "script": report.script,
+            "order": report.order,
+            "tasks": tasks,
+        });
+        return ExtResponse {
+            code: 0,
+            stdout: format!(
+                "{}\n",
+                serde_json::to_string_pretty(&value).unwrap_or_default()
+            ),
+            stderr: String::new(),
+        };
+    }
+    let mut out = Out::default();
+    out.stdout.push_str(&format!(
+        "plan for `{}` (order: {})\n",
+        report.script,
+        report.order.join(", ")
+    ));
+    for t in &report.tasks {
+        let verdict = match &t.verdict {
+            handl_run::PlanVerdict::Hit => "hit".to_string(),
+            handl_run::PlanVerdict::Miss(r) => format!("miss: {r}"),
+            handl_run::PlanVerdict::Uncached => "uncached".to_string(),
+        };
+        out.stdout.push_str(&format!("  {}: {verdict}\n", t.name));
+    }
+    code(0, out)
 }
 
 fn run_file(
@@ -211,11 +495,11 @@ fn run_file(
     // — otherwise `import "<kit-lib>/…"` lines can't be told apart from
     // host-module declarations for stripping/splice-prelude purposes.
     let mut deps = handl_platform::discover_dependencies(&disk).unwrap_or_default();
-    if let Some(kd) = &kit_dir {
-        if let Ok(kit_deps) = handl_platform::resolve_kit_dependencies(kd) {
-            for (name, dir) in kit_deps {
-                deps.entry(name).or_insert(dir);
-            }
+    if let Some(kd) = &kit_dir
+        && let Ok(kit_deps) = handl_platform::resolve_kit_dependencies(kd)
+    {
+        for (name, dir) in kit_deps {
+            deps.entry(name).or_insert(dir);
         }
     }
     if detect_dialect(&source) == Dialect::Canonical {
@@ -1337,5 +1621,187 @@ mod tests {
         assert_eq!(manifest.name, "eval");
         let names: Vec<&str> = manifest.commands.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["run", "eval"]);
+    }
+
+    // -----------------------------------------------------------------
+    // `hnl run` script dispatch (P-003)
+    // -----------------------------------------------------------------
+
+    /// Write a minimal `pkg.hnl` whose `scripts` table is `body`.
+    fn write_pkg(dir: &Path, body: &str) {
+        std::fs::write(
+            dir.join("pkg.hnl"),
+            format!("{{ scripts: {{ {body} }} }}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn run_no_args_lists_pkg_scripts() {
+        let dir = tmpdir("run-list");
+        write_pkg(&dir, r#"hi: "echo hello", bye: "echo bye""#);
+        let res = run_command(&[], &dir);
+        assert_eq!(res.code, 0, "stderr: {}", res.stderr);
+        assert!(res.stdout.contains("hi"), "stdout: {}", res.stdout);
+        assert!(res.stdout.contains("bye"), "stdout: {}", res.stdout);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_no_args_without_pkg_is_usage_error() {
+        let dir = tmpdir("run-nopkg");
+        let res = run_command(&[], &dir);
+        assert_eq!(res.code, 2);
+        assert!(
+            res.stderr.contains("usage: hnl run"),
+            "stderr: {}",
+            res.stderr
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_script_name_executes() {
+        let dir = tmpdir("run-script");
+        write_pkg(&dir, r#"hi: "echo hello-script""#);
+        let res = run_command(&["hi".into()], &dir);
+        assert_eq!(res.code, 0, "stdout: {} stderr: {}", res.stdout, res.stderr);
+        assert_eq!(res.stdout, "hello-script\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_existing_file_beats_script_name() {
+        let dir = tmpdir("run-precedence");
+        // A file literally named `gate` shadows script `gate` — the
+        // spec's deterministic precedence rule.
+        write_pkg(&dir, r#"gate: "echo script-wins""#);
+        std::fs::write(dir.join("gate"), "40 + 2").unwrap();
+        let res = run_command(&["gate".into()], &dir);
+        assert_eq!(res.code, 0, "stdout: {} stderr: {}", res.stdout, res.stderr);
+        assert_eq!(res.stdout, "42\n", "file exec must win over the script");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_script_args_are_verbatim_argv() {
+        let dir = tmpdir("run-argv");
+        write_pkg(&dir, r#"hi: "echo hi""#);
+        // Runner-looking flags after the name are script argv.
+        let res = run_command(&["hi".into(), "--json".into(), "--flag".into()], &dir);
+        assert_eq!(res.code, 0, "stderr: {}", res.stderr);
+        assert_eq!(res.stdout, "hi --json --flag\n");
+        // A leading `--` is the optional separator and is stripped.
+        let res = run_command(
+            &["--".into(), "hi".into(), "--".into(), "--json".into()],
+            &dir,
+        );
+        assert_eq!(res.code, 0, "stderr: {}", res.stderr);
+        assert_eq!(res.stdout, "hi --json\n");
+        // `--` mid-argv is verbatim (belongs to the script).
+        let res = run_command(&["hi".into(), "a".into(), "--".into(), "b".into()], &dir);
+        assert_eq!(res.code, 0, "stderr: {}", res.stderr);
+        assert_eq!(res.stdout, "hi a -- b\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_json_before_name_emits_run_report() {
+        let dir = tmpdir("run-json");
+        write_pkg(&dir, r#"hi: "echo json-out""#);
+        let res = run_command(&["--json".into(), "hi".into()], &dir);
+        assert_eq!(res.code, 0, "stdout: {} stderr: {}", res.stdout, res.stderr);
+        let report: Value = serde_json::from_str(res.stdout.trim()).unwrap();
+        assert_eq!(report["script"], "hi");
+        assert_eq!(report["exit_code"], 0);
+        assert_eq!(report["stdout"], "json-out\n");
+        assert_eq!(report["tasks"][0]["status"], "ran");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_plan_prints_verdicts_without_executing() {
+        let dir = tmpdir("run-plan");
+        write_pkg(&dir, r#"t: { run: "echo should-not-print", cache: true }"#);
+        let res = run_command(&["--plan".into(), "t".into()], &dir);
+        assert_eq!(res.code, 0, "stdout: {} stderr: {}", res.stdout, res.stderr);
+        assert!(res.stdout.contains("t:"), "stdout: {}", res.stdout);
+        assert!(res.stdout.contains("miss"), "stdout: {}", res.stdout);
+        assert!(
+            !res.stdout.contains("should-not-print"),
+            "plan must not execute: {}",
+            res.stdout
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_script_not_found_is_error_naming_available() {
+        let dir = tmpdir("run-unknown");
+        write_pkg(&dir, r#"hi: "echo hi""#);
+        let res = run_command(&["nope".into()], &dir);
+        assert_eq!(res.code, 1, "stderr: {}", res.stderr);
+        assert!(
+            res.stderr.contains("unknown script"),
+            "stderr: {}",
+            res.stderr
+        );
+        assert!(res.stderr.contains("hi"), "stderr: {}", res.stderr);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_script_name_without_pkg_is_error() {
+        let dir = tmpdir("run-nopkg-name");
+        let res = run_command(&["hi".into()], &dir);
+        assert_eq!(res.code, 1, "stderr: {}", res.stderr);
+        assert!(res.stderr.contains("no pkg.hnl"), "stderr: {}", res.stderr);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_file_exec_flags_with_script_name_is_error() {
+        let dir = tmpdir("run-flag-mix");
+        write_pkg(&dir, r#"hi: "echo hi""#);
+        let res = run_command(&["--kit".into(), "somewhere".into(), "hi".into()], &dir);
+        assert_eq!(res.code, 2, "stderr: {}", res.stderr);
+        assert!(
+            res.stderr.contains("do not apply to script names"),
+            "stderr: {}",
+            res.stderr
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_runner_flag_with_file_is_error() {
+        let dir = tmpdir("run-flag-file");
+        let file = dir.join("main.hnl");
+        std::fs::write(&file, "1").unwrap();
+        let res = run_command(
+            &["--json".into(), file.to_string_lossy().into_owned()],
+            &dir,
+        );
+        assert_eq!(res.code, 2, "stderr: {}", res.stderr);
+        assert!(
+            res.stderr.contains("not file execution"),
+            "stderr: {}",
+            res.stderr
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_unknown_flag_before_name_is_usage_error() {
+        let dir = tmpdir("run-badflag");
+        write_pkg(&dir, r#"hi: "echo hi""#);
+        let res = run_command(&["--bogus".into(), "hi".into()], &dir);
+        assert_eq!(res.code, 2, "stderr: {}", res.stderr);
+        assert!(
+            res.stderr.contains("unknown flag"),
+            "stderr: {}",
+            res.stderr
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
