@@ -531,7 +531,7 @@ fn run_file(
     let env = transform_categorical::dim_env(&ast, lang);
     let rules = transform_categorical::collect_rules(&ast, &bound, &env, lang);
     let protected = Arc::new(transform_categorical::dim_arrow_subtrees(&ast, lang));
-    let engine = hnl_engine_transform_rewrite::RewriteEngine::new().with_native_registry(
+    let engine = hnl_tool_transform_rewrite::RewriteEngine::new().with_native_registry(
         transform_categorical::native(rules, protected, Arc::new(env)),
     );
     let out_pass = match engine.run_pass(lang, &ast, AstRef::new(ast.len() - 1), "n_dim_opt") {
@@ -1174,7 +1174,7 @@ fn arrow_display(
             .and_then(|(src, span)| src.get(span.start..span.end))
             .map(|s| s.trim().to_string())
             .or_else(|| {
-                hnl_engine_fmt::FormatEngine::new()
+                hnl_tool_fmt::FormatEngine::new()
                     .format(lang, &def, root)
                     .ok()
                     .map(|s| s.trim().to_string())
