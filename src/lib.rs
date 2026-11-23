@@ -149,15 +149,28 @@ fn run_file(
 
     // `--kit <dir-or-name>`: resolve to a kit directory before building
     // the kit so its `libs` deps merge into the project deps below.
+    // Without the flag, T-122 discovery applies: the nearest ancestor
+    // `.handl.toml` of the target file declaring `kit = "<spec>"` wins,
+    // falling back to `~/.config/handl/.handl.toml`; the spec resolves
+    // against its manifest's directory exactly like a `--kit` value.
     let kit_dir = match kit {
-        Some(v) => match resolve_kit_dir(cwd, v, "run") {
+        Some(v) => match resolve_kit_dir(cwd, v, "run", "--kit") {
             Ok(d) => Some(d),
             Err(msg) => {
                 out.err(msg);
                 return code(2, out);
             }
         },
-        None => None,
+        None => match handl_platform::discover_kit_spec(&disk) {
+            Some(dk) => match resolve_kit_dir(&dk.manifest_dir, &dk.spec, "run", "kit") {
+                Ok(d) => Some(d),
+                Err(msg) => {
+                    out.err(msg);
+                    return code(2, out);
+                }
+            },
+            None => None,
+        },
     };
 
     // Project-aware kit: discover `.handl.toml` by walking up from the
@@ -192,7 +205,19 @@ fn run_file(
     // Splice-form file imports (`import "<spec>"`, `from "<spec>" import *`)
     // bind the module's exports into scope at eval time — seed those names
     // so the scope check sees them.
-    let deps = handl_platform::discover_dependencies(&disk).unwrap_or_default();
+    // The run pipeline's own dep view must see the same names the kit's
+    // ModuleLoader does: project `[dependencies]` plus the selected
+    // kit's `libs` (+ transitive `pkg.hnl` deps) as fill-missing entries
+    // — otherwise `import "<kit-lib>/…"` lines can't be told apart from
+    // host-module declarations for stripping/splice-prelude purposes.
+    let mut deps = handl_platform::discover_dependencies(&disk).unwrap_or_default();
+    if let Some(kd) = &kit_dir {
+        if let Ok(kit_deps) = handl_platform::resolve_kit_dependencies(kd) {
+            for (name, dir) in kit_deps {
+                deps.entry(name).or_insert(dir);
+            }
+        }
+    }
     if detect_dialect(&source) == Dialect::Canonical {
         let spliced = spliced_import_names(&source, &bases, &deps);
         if let Err(e) = kit.typecheck_with_prelude(&source, &spliced) {
@@ -289,15 +314,26 @@ fn eval_expression(expr: Option<&str>, kit: Option<&str>, cwd: &Path) -> ExtResp
         }
     };
 
+    // T-122: no target file for `eval` — discovery walks up from the
+    // request cwd, same as the project-manifest discovery below.
     let kit_dir = match kit {
-        Some(v) => match resolve_kit_dir(cwd, v, "eval") {
+        Some(v) => match resolve_kit_dir(cwd, v, "eval", "--kit") {
             Ok(d) => Some(d),
             Err(msg) => {
                 out.err(msg);
                 return code(2, out);
             }
         },
-        None => None,
+        None => match handl_platform::discover_kit_spec(cwd) {
+            Some(dk) => match resolve_kit_dir(&dk.manifest_dir, &dk.spec, "eval", "kit") {
+                Ok(d) => Some(d),
+                Err(msg) => {
+                    out.err(msg);
+                    return code(2, out);
+                }
+            },
+            None => None,
+        },
     };
 
     // Project-aware kit: discover `.handl.toml` from the CWD upward so
@@ -356,23 +392,27 @@ fn resolve(cwd: &Path, path: &str) -> PathBuf {
     }
 }
 
-/// Resolve a `--kit` value to a kit directory: the value itself (a path to
-/// the kit repo root or its `kit.hnl`, relative to `cwd`), then — for a
-/// bare name with no path separator — the workspace conventions
-/// `cwd/kit-<name>` and `cwd/../kit-<name>` (kits are `kit-<name>` sibling
-/// checkouts, e.g. `--kit web-server` → `kit-web-server`).
+/// Resolve a `--kit` value — or a `.handl.toml` `kit =` spec — to a kit
+/// directory: the value itself (a path to the kit repo root or its
+/// `kit.hnl`, relative to `base`), then — for a bare name with no path
+/// separator — the workspace conventions `base/kit-<name>` and
+/// `base/../kit-<name>` (kits are `kit-<name>` sibling checkouts, e.g.
+/// `--kit web-server` → `kit-web-server`). `base` is the request cwd for
+/// an explicit `--kit` and the declaring manifest's directory for a
+/// discovered spec.
 ///
-/// `cmd` prefixes the error (`run:`/`eval:`). Returns `Err` when no
-/// candidate contains a `kit.hnl`.
-fn resolve_kit_dir(cwd: &Path, value: &str, cmd: &str) -> Result<PathBuf, String> {
+/// `cmd` prefixes the error (`run:`/`eval:`); `via` names the source in
+/// the message (`--kit` or `kit`). Returns `Err` when no candidate
+/// contains a `kit.hnl`.
+fn resolve_kit_dir(base: &Path, value: &str, cmd: &str, via: &str) -> Result<PathBuf, String> {
     let is_kit = |dir: &Path| dir.join("kit.hnl").is_file();
-    let direct = resolve(cwd, value);
+    let direct = resolve(base, value);
     if is_kit(&direct) || (direct.is_file() && direct.file_name().is_some_and(|n| n == "kit.hnl")) {
         return Ok(direct);
     }
     if !value.contains('/') && !value.contains('\\') {
-        let mut bases = vec![cwd.to_path_buf()];
-        if let Some(parent) = cwd.parent() {
+        let mut bases = vec![base.to_path_buf()];
+        if let Some(parent) = base.parent() {
             bases.push(parent.to_path_buf());
         }
         for base in bases {
@@ -383,7 +423,7 @@ fn resolve_kit_dir(cwd: &Path, value: &str, cmd: &str) -> Result<PathBuf, String
         }
     }
     Err(format!(
-        "{cmd}: --kit {value}: no kit.hnl found (expected a kit directory or a sibling kit-<name> checkout)"
+        "{cmd}: {via} {value}: no kit.hnl found (expected a kit directory or a sibling kit-<name> checkout)"
     ))
 }
 
@@ -1108,18 +1148,110 @@ mod tests {
 
         // Path form (relative to cwd) and the kit.hnl file itself.
         assert_eq!(
-            resolve_kit_dir(&dir, "kit-demo", "run").unwrap(),
+            resolve_kit_dir(&dir, "kit-demo", "run", "--kit").unwrap(),
             kit
         );
         assert_eq!(
-            resolve_kit_dir(&dir, "kit-demo/kit.hnl", "run").unwrap(),
+            resolve_kit_dir(&dir, "kit-demo/kit.hnl", "run", "--kit").unwrap(),
             kit.join("kit.hnl")
         );
         // Bare name: sibling probe from cwd and from a child dir.
-        assert_eq!(resolve_kit_dir(&dir, "demo", "run").unwrap(), kit);
-        assert_eq!(resolve_kit_dir(&proj, "demo", "run").unwrap(), kit);
+        assert_eq!(resolve_kit_dir(&dir, "demo", "run", "--kit").unwrap(), kit);
+        assert_eq!(
+            resolve_kit_dir(&proj, "demo", "run", "--kit").unwrap(),
+            kit
+        );
         // Names containing a separator skip the sibling probe.
-        assert!(resolve_kit_dir(&dir, "sub/dir", "run").is_err());
+        assert!(resolve_kit_dir(&dir, "sub/dir", "run", "--kit").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// T-122: `hnl run` picks up the `kit =` of the nearest ancestor
+    /// `.handl.toml` when `--kit` is absent — the kit's `libs` deps merge
+    /// into the project deps, and an explicit `--kit` still wins.
+    #[test]
+    fn run_discovers_kit_from_handl_toml() {
+        let dir = tmpdir("kit-disc");
+        let kit = dir.join("kit-web");
+        let lib_js = dir.join("lib-js");
+        std::fs::create_dir_all(&kit).unwrap();
+        std::fs::create_dir_all(&lib_js).unwrap();
+        std::fs::write(kit.join("kit.hnl"), "{ libs: [\"js\"] }\n").unwrap();
+        // `lib-js` exports a binding the file uses; without the kit the
+        // import would not resolve. `export` (not `::`) so the spliced
+        // name reaches the typecheck prelude.
+        std::fs::write(lib_js.join("answer.hnl"), "export answer := 42\n").unwrap();
+
+        let proj = dir.join("proj");
+        let nested = proj.join("src/deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        // Project manifest two levels up declares the kit by bare *name* —
+        // the sibling `kit-<name>` probe anchors at the manifest dir
+        // (`proj/../kit-web`).
+        std::fs::write(proj.join(".handl.toml"), "kit = \"web\"\n").unwrap();
+        let file = nested.join("main.hnl");
+        std::fs::write(&file, "import \"js/answer.hnl\"\nanswer").unwrap();
+
+        // Discovered kit: `import "js/answer.hnl"` resolves through the
+        // kit's libs.
+        let res = run_command(&[file.to_string_lossy().into_owned()], &dir);
+        assert_eq!(res.code, 0, "stdout: {} stderr: {}", res.stdout, res.stderr);
+        assert_eq!(res.stdout, "42\n");
+
+        // `--kit` overrides discovery: point it at an empty kit and the
+        // `js` dep disappears → the import fails.
+        let empty = dir.join("kit-empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(empty.join("kit.hnl"), "{ libs: [] }\n").unwrap();
+        let res = run_command(
+            &[
+                "--kit".into(),
+                empty.to_string_lossy().into_owned(),
+                file.to_string_lossy().into_owned(),
+            ],
+            &dir,
+        );
+        assert_ne!(res.code, 0, "expected failure without the kit dep");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// T-122: `hnl eval` discovers `kit =` walking up from the cwd.
+    #[test]
+    fn eval_discovers_kit_from_handl_toml() {
+        let dir = tmpdir("eval-kit-disc");
+        let kit = dir.join("kit-x");
+        let lib_x = dir.join("lib-x");
+        std::fs::create_dir_all(&kit).unwrap();
+        std::fs::create_dir_all(&lib_x).unwrap();
+        std::fs::write(kit.join("kit.hnl"), "{ libs: [\"x\"] }\n").unwrap();
+        std::fs::write(lib_x.join("answer.hnl"), "answer :: 42\n").unwrap();
+        let proj = dir.join("proj");
+        let nested = proj.join("sub");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(proj.join(".handl.toml"), "kit = \"../kit-x\"\n").unwrap();
+
+        // From a nested cwd the walk finds the project manifest.
+        let res = eval_command(&["import \"x/answer.hnl\"\nanswer".into()], &nested);
+        assert_eq!(res.code, 0, "stdout: {} stderr: {}", res.stdout, res.stderr);
+        assert_eq!(res.stdout, "42\n");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A discovered `kit =` spec that resolves to no `kit.hnl` fails
+    /// like an explicit `--kit` does.
+    #[test]
+    fn run_missing_discovered_kit_is_error() {
+        let dir = tmpdir("kit-disc-missing");
+        let proj = dir.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join(".handl.toml"), "kit = \"no-such-kit\"\n").unwrap();
+        let file = proj.join("main.hnl");
+        std::fs::write(&file, "1").unwrap();
+        let res = run_command(&[file.to_string_lossy().into_owned()], &dir);
+        assert_eq!(res.code, 2);
+        assert!(res.stderr.contains("no kit.hnl"), "stderr: {}", res.stderr);
         std::fs::remove_dir_all(&dir).ok();
     }
 
