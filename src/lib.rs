@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use handl_ext::{ExtRequest, ExtResponse, ExtensionManifest};
-use handl_kit_prelude::Kit;
 use handl_kit_pkg::KitProjectExt;
+use handl_kit_prelude::Kit;
 use handl_language::{AstRef, Language};
 use handl_plugin_ext_detect::{Dialect, detect_dialect};
 use serde_json::Value;
@@ -247,12 +247,9 @@ fn run_file(
     let env = transform_categorical::dim_env(&ast, lang);
     let rules = transform_categorical::collect_rules(&ast, &bound, &env, lang);
     let protected = Arc::new(transform_categorical::dim_arrow_subtrees(&ast, lang));
-    let engine = hnl_engine_transform_rewrite::RewriteEngine::new()
-        .with_native_registry(transform_categorical::native(
-            rules,
-            protected,
-            Arc::new(env),
-        ));
+    let engine = hnl_engine_transform_rewrite::RewriteEngine::new().with_native_registry(
+        transform_categorical::native(rules, protected, Arc::new(env)),
+    );
     let out_pass = match engine.run_pass(lang, &ast, AstRef::new(ast.len() - 1), "n_dim_opt") {
         Ok(o) => o,
         Err(e) => {
@@ -444,10 +441,8 @@ fn wrap_run_source(source: &str, name: Option<&str>) -> String {
         None if starts_do => source.to_string(),
         None => format!("do {{\n{}\n}}", source),
         Some(n) => {
-            if starts_do {
-                if let Some(close) = do_block_close(trimmed) {
-                    return format!("{}\n{}\n{}", &trimmed[..close], n, &trimmed[close..]);
-                }
+            if starts_do && let Some(close) = do_block_close(trimmed) {
+                return format!("{}\n{}\n{}", &trimmed[..close], n, &trimmed[close..]);
             }
             format!("do {{\n{}\n{}\n}}", source, n)
         }
@@ -533,18 +528,18 @@ fn is_import_line(
         // kept either way): never a strippable declaration.
         return false;
     }
-    if let Some(rest) = trimmed.strip_prefix("from") {
-        if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t') {
-            // Strip iff the specifier names a host module — i.e. resolves to
-            // neither a file under `bases` nor a `[dependencies]` package
-            // (a dep-backed `from` is an executable import op and must be
-            // kept, exactly like a relative-path one). An unparseable line
-            // is kept so the parser reports the error.
-            return match first_quoted_spec(rest) {
-                Some(spec) => !spec_resolves_to_file(spec, bases, deps),
-                None => false,
-            };
-        }
+    if let Some(rest) = trimmed.strip_prefix("from")
+        && (rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t'))
+    {
+        // Strip iff the specifier names a host module — i.e. resolves to
+        // neither a file under `bases` nor a `[dependencies]` package
+        // (a dep-backed `from` is an executable import op and must be
+        // kept, exactly like a relative-path one). An unparseable line
+        // is kept so the parser reports the error.
+        return match first_quoted_spec(rest) {
+            Some(spec) => !spec_resolves_to_file(spec, bases, deps),
+            None => false,
+        };
     }
     false
 }
@@ -577,15 +572,15 @@ fn spec_resolution_bases(path: &Path, module_root: Option<&Path>) -> Vec<PathBuf
         Some(dir) if !dir.as_os_str().is_empty() => bases.push(dir.to_path_buf()),
         _ => bases.push(PathBuf::from(".")),
     }
-    if let Some(root) = module_root {
-        if !bases.iter().any(|b| b.as_path() == root) {
-            bases.push(root.to_path_buf());
-        }
+    if let Some(root) = module_root
+        && !bases.iter().any(|b| b.as_path() == root)
+    {
+        bases.push(root.to_path_buf());
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        if !bases.iter().any(|b| *b == cwd) {
-            bases.push(cwd);
-        }
+    if let Ok(cwd) = std::env::current_dir()
+        && !bases.contains(&cwd)
+    {
+        bases.push(cwd);
     }
     bases
 }
@@ -621,8 +616,11 @@ fn resolve_spec_path(
     if Path::new(spec).is_absolute() {
         return file_candidate(Path::new(spec), spec);
     }
-    resolve_dep_spec_path(spec, deps)
-        .or_else(|| bases.iter().find_map(|base| file_candidate(&base.join(spec), spec)))
+    resolve_dep_spec_path(spec, deps).or_else(|| {
+        bases
+            .iter()
+            .find_map(|base| file_candidate(&base.join(spec), spec))
+    })
 }
 
 /// The specifier of a *splice-form* import — `import "<spec>"` or
@@ -760,16 +758,24 @@ fn compact_arrows(value: &Value, lang: &Language, source: Option<&str>) -> Value
     // combinator (`{"Op": …}`, `{"Seq": …}`…). Module records embed them
     // under `binds`/`body_term`; printing the raw JSON dumps the full
     // program — collapse to a marker like the arrow collapse.
-    if let Value::Object(o) = value {
-        if o.len() == 1 {
-            let k = o.keys().next().unwrap().as_str();
-            if matches!(
-                k,
-                "Op" | "Seq" | "Choice" | "First" | "Loop" | "App" | "Arr" | "Const"
-                    | "Handle" | "Let" | "Lit"
-            ) {
-                return Value::String("<term>".to_string());
-            }
+    if let Value::Object(o) = value
+        && o.len() == 1
+    {
+        let k = o.keys().next().unwrap().as_str();
+        if matches!(
+            k,
+            "Op" | "Seq"
+                | "Choice"
+                | "First"
+                | "Loop"
+                | "App"
+                | "Arr"
+                | "Const"
+                | "Handle"
+                | "Let"
+                | "Lit"
+        ) {
+            return Value::String("<term>".to_string());
         }
     }
     match value {
@@ -875,22 +881,22 @@ fn arrow_display(
                 .join(", ")
         })
         .unwrap_or_default();
-    if let Some(def) = obj.get("body_def").and_then(handl_language::as_ast) {
-        if !def.is_empty() {
-            let root = AstRef::new(def.len() - 1);
-            let body = source
-                .zip(def.at(root).ok().and_then(|n| n.span))
-                .and_then(|(src, span)| src.get(span.start..span.end))
-                .map(|s| s.trim().to_string())
-                .or_else(|| {
-                    hnl_engine_fmt::FormatEngine::new()
-                        .format(lang, &def, root)
-                        .ok()
-                        .map(|s| s.trim().to_string())
-                });
-            if let Some(b) = body {
-                return Some(format!("{params} ~> {b}"));
-            }
+    if let Some(def) = obj.get("body_def").and_then(handl_language::as_ast)
+        && !def.is_empty()
+    {
+        let root = AstRef::new(def.len() - 1);
+        let body = source
+            .zip(def.at(root).ok().and_then(|n| n.span))
+            .and_then(|(src, span)| src.get(span.start..span.end))
+            .map(|s| s.trim().to_string())
+            .or_else(|| {
+                hnl_engine_fmt::FormatEngine::new()
+                    .format(lang, &def, root)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+            });
+        if let Some(b) = body {
+            return Some(format!("{params} ~> {b}"));
         }
     }
     Some("<arrow>".to_string())
@@ -988,7 +994,6 @@ fn def_eq(a: &Value, b: &Value, depth: usize) -> bool {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1066,7 +1071,11 @@ mod tests {
         // The block tail (`x + y` = 3) is ignored: `--name y` wins.
         std::fs::write(&file, "export x := 1\nexport y := x + 41\nx + y").unwrap();
         let res = run_command(
-            &["--name".into(), "y".into(), file.to_string_lossy().into_owned()],
+            &[
+                "--name".into(),
+                "y".into(),
+                file.to_string_lossy().into_owned(),
+            ],
             &dir,
         );
         assert_eq!(res.code, 0, "stdout: {} stderr: {}", res.stdout, res.stderr);
@@ -1083,7 +1092,11 @@ mod tests {
         // binding here; top-level exports are covered above.)
         std::fs::write(&file, "do {\n  x := 41\n  x + 1\n}").unwrap();
         let res = run_command(
-            &["--name".into(), "x".into(), file.to_string_lossy().into_owned()],
+            &[
+                "--name".into(),
+                "x".into(),
+                file.to_string_lossy().into_owned(),
+            ],
             &dir,
         );
         assert_eq!(res.code, 0, "stdout: {} stderr: {}", res.stdout, res.stderr);
@@ -1157,10 +1170,7 @@ mod tests {
         );
         // Bare name: sibling probe from cwd and from a child dir.
         assert_eq!(resolve_kit_dir(&dir, "demo", "run", "--kit").unwrap(), kit);
-        assert_eq!(
-            resolve_kit_dir(&proj, "demo", "run", "--kit").unwrap(),
-            kit
-        );
+        assert_eq!(resolve_kit_dir(&proj, "demo", "run", "--kit").unwrap(), kit);
         // Names containing a separator skip the sibling probe.
         assert!(resolve_kit_dir(&dir, "sub/dir", "run", "--kit").is_err());
         std::fs::remove_dir_all(&dir).ok();
