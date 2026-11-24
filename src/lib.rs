@@ -1519,7 +1519,7 @@ mod tests {
         std::fs::create_dir_all(&kit).unwrap();
         std::fs::create_dir_all(&lib_x).unwrap();
         std::fs::write(kit.join("kit.hnl"), "{ libs: [\"x\"] }\n").unwrap();
-        std::fs::write(lib_x.join("answer.hnl"), "answer :: 42\n").unwrap();
+        std::fs::write(lib_x.join("answer.hnl"), "answer := 42\n").unwrap();
         let proj = dir.join("proj");
         let nested = proj.join("sub");
         std::fs::create_dir_all(&nested).unwrap();
