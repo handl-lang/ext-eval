@@ -495,6 +495,10 @@ fn run_file(
     // — otherwise `import "<kit-lib>/…"` lines can't be told apart from
     // host-module declarations for stripping/splice-prelude purposes.
     let mut deps = handl_platform::discover_dependencies(&disk).unwrap_or_default();
+    // P-013 T-150: the consuming package's `pkg.hnl` dep scopes — the
+    // scope-check prelude must seed exactly the declared surface, matching
+    // what the `ModuleLoader` scope filter exposes at eval time.
+    let dep_scopes = handl_platform::discover_dep_scopes(&disk);
     if let Some(kd) = &kit_dir
         && let Ok(kit_deps) = handl_platform::resolve_kit_dependencies(kd)
     {
@@ -503,7 +507,7 @@ fn run_file(
         }
     }
     if detect_dialect(&source) == Dialect::Canonical {
-        let spliced = spliced_import_names(&source, &bases, &deps);
+        let spliced = spliced_import_names(&source, &bases, &deps, &dep_scopes);
         if let Err(e) = kit.typecheck_with_prelude(&source, &spliced) {
             out.err(format!("run: typecheck failed: {e}"));
             return code(1, out);
@@ -956,6 +960,7 @@ fn spliced_import_names(
     src: &str,
     bases: &[PathBuf],
     deps: &std::collections::HashMap<String, PathBuf>,
+    scopes: &std::collections::HashMap<String, handl_platform::PkgDepScope>,
 ) -> HashSet<String> {
     let mut names = HashSet::new();
     for line in src.lines() {
@@ -972,7 +977,16 @@ fn spliced_import_names(
         let Ok(mod_src) = std::fs::read_to_string(&path) else {
             continue;
         };
-        names.extend(handl_runtime::module_prep::module_export_names(&mod_src));
+        let mut exported = handl_runtime::module_prep::module_export_names(&mod_src);
+        // P-013 T-150: a dep-scoped specifier seeds only the declared
+        // `module.field` surface — a scoped-out export stays unbound.
+        if let Some((scope, _, module)) = handl_platform::dep_spec_scope(scopes, &spec) {
+            if !scope.allows_module(&module) {
+                continue;
+            }
+            exported.retain(|n| scope.allows_field(&module, n));
+        }
+        names.extend(exported);
     }
     names
 }
